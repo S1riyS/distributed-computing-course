@@ -1,0 +1,9 @@
+# Archive with solution
+**/result
+# Logs
+**/*.log
+# Executable
+**/pa*
+# Source code
+!*.c
+!*.h
