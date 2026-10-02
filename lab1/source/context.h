@@ -9,11 +9,11 @@ typedef struct {
 } ChannelBuf;
 
 typedef struct {
-    local_id id;
+    local_id id; // ID of worker itself
     local_id process_count;
     int read_fd[MAX_PROCESS_ID + 1];
     int write_fd[MAX_PROCESS_ID + 1];
-    ChannelBuf incoming[MAX_PROCESS_ID + 1];
+    ChannelBuf incoming[MAX_PROCESS_ID + 1]; // Temporary data from worker[i]
 } Context;
 
 #endif
