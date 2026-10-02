@@ -3,6 +3,7 @@
 #include "context.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <sched.h>
 #include <string.h>
 #include <unistd.h>
@@ -57,10 +58,19 @@ static int take_message(ChannelBuf *ch, Message *msg) {
     return 1;
 }
 
-static int read_more(int fd, ChannelBuf *ch) {
+static int read_more(int fd, ChannelBuf *ch, int wait) {
+    int flags = -1;
+    if (!wait) {
+        flags = fcntl(fd, F_GETFL);
+        if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) return -1;
+    }
+
     ssize_t n = read(fd, ch->data + ch->filled, MAX_MESSAGE_LEN - ch->filled);
+    int err = errno;
+    if (!wait) fcntl(fd, F_SETFL, flags);
+
     if (n < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return 1;
+        if (err == EINTR || (!wait && (err == EAGAIN || err == EWOULDBLOCK))) return 1;
         return -1;
     }
     if (n == 0) return -1;
@@ -74,7 +84,7 @@ static int receive_from(Context *ctx, local_id from, Message *msg, int wait) {
         int ready = take_message(ch, msg);
         if (ready != 0) return ready < 0 ? -1 : 0;
 
-        int rc = read_more(ctx->read_fd[from], ch);
+        int rc = read_more(ctx->read_fd[from], ch, wait);
         if (rc < 0) return -1;
         if (rc > 0) {
             if (!wait) return 1;

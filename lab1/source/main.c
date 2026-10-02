@@ -40,13 +40,6 @@ static void fill_message(Message *msg, MessageType type, const char *text) {
   memcpy(msg->s_payload, text, msg->s_header.s_payload_len);
 }
 
-static int set_nonblock(int fd) {
-  int flags = fcntl(fd, F_GETFL);
-  if (flags < 0)
-    return -1;
-  return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-}
-
 static int bind_pipes(Context *ctx, int pipes[][MAX_PROCESS_ID + 1][2]) {
   local_id n = ctx->process_count;
   for (local_id i = 0; i < n; i++) {
@@ -69,10 +62,6 @@ static int bind_pipes(Context *ctx, int pipes[][MAX_PROCESS_ID + 1][2]) {
       else if (close(pipes[from][to][1]) != 0)
         return -1;
     }
-  }
-  for (local_id from = 0; from < n; from++) {
-    if (from != ctx->id && set_nonblock(ctx->read_fd[from]) != 0)
-      return -1;
   }
   return 0;
 }
@@ -116,7 +105,7 @@ static int child_work(Context *ctx) {
   return 0;
 }
 
-static int parent_work(Context *ctx, const pid_t *pids) {
+static int parent_work(Context *ctx) {
   if (await_from_children(ctx, STARTED) != 0)
     return -1;
   if (await_from_children(ctx, DONE) != 0)
@@ -124,8 +113,8 @@ static int parent_work(Context *ctx, const pid_t *pids) {
 
   int status = 0;
   for (local_id i = 1; i < ctx->process_count; i++) {
-    int child_status;
-    if (waitpid(pids[i], &child_status, 0) < 0)
+    int child_status = 0;
+    if (wait(&child_status) < 0)
       return -1;
     if (!WIFEXITED(child_status) || WEXITSTATUS(child_status) != 0)
       status = -1;
@@ -176,7 +165,6 @@ int main(int argc, char *argv[]) {
   if (events_fd < 0)
     return 1;
 
-  pid_t pids[MAX_PROCESS_ID + 1] = {0};
   local_id id = PARENT_ID;
   for (local_id i = 1; i < process_count; i++) {
     pid_t pid = fork();
@@ -186,7 +174,6 @@ int main(int argc, char *argv[]) {
       id = i;
       break;
     }
-    pids[i] = pid;
   }
 
   Context ctx;
@@ -196,6 +183,6 @@ int main(int argc, char *argv[]) {
   if (bind_pipes(&ctx, pipes) != 0)
     return 1;
 
-  int rc = (id == PARENT_ID) ? parent_work(&ctx, pids) : child_work(&ctx);
+  int rc = (id == PARENT_ID) ? parent_work(&ctx) : child_work(&ctx);
   return rc == 0 ? 0 : 1;
 }
