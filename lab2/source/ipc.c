@@ -3,7 +3,6 @@
 #include "context.h"
 
 #include <errno.h>
-#include <fcntl.h>
 #include <sched.h>
 #include <string.h>
 #include <unistd.h>
@@ -14,7 +13,10 @@ static int write_full(int fd, const void *buf, size_t len) {
     while (off < len) {
         ssize_t n = write(fd, bytes + off, len - off);
         if (n < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+                sched_yield();
+                continue;
+            }
             return -1;
         }
         off += (size_t)n;
@@ -58,22 +60,15 @@ static int take_message(ChannelBuf *ch, Message *msg) {
     return 1;
 }
 
-static int read_more(int fd, ChannelBuf *ch, int wait) {
-    int flags = -1;
-    if (!wait) {
-        flags = fcntl(fd, F_GETFL);
-        if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) return -1;
-    }
-
+static int read_more(int fd, ChannelBuf *ch) {
     ssize_t n = read(fd, ch->data + ch->filled, MAX_MESSAGE_LEN - ch->filled);
     int err = errno;
-    if (!wait) fcntl(fd, F_SETFL, flags);
 
     if (n < 0) {
-        if (err == EINTR || (!wait && (err == EAGAIN || err == EWOULDBLOCK))) return 1;
+        if (err == EINTR || err == EAGAIN || err == EWOULDBLOCK) return 1;
         return -1;
     }
-    if (n == 0) return -1;
+    if (n == 0) return ch->filled > 0 ? -1 : -2;
     ch->filled += (size_t)n;
     return 0;
 }
@@ -84,7 +79,12 @@ static int receive_from(Context *ctx, local_id from, Message *msg, int wait) {
         int ready = take_message(ch, msg);
         if (ready != 0) return ready < 0 ? -1 : 0;
 
-        int rc = read_more(ctx->read_fd[from], ch, wait);
+        int rc = read_more(ctx->read_fd[from], ch);
+        if (rc == -2) {
+            ctx->read_fd[from] = -1;
+            if (wait) return -1;
+            return 1;
+        }
         if (rc < 0) return -1;
         if (rc > 0) {
             if (!wait) return 1;
@@ -102,11 +102,14 @@ int receive(void *self, local_id from, Message *msg) {
 int receive_any(void *self, Message *msg) {
     Context *ctx = self;
     for (;;) {
+        int alive = 0;
         for (local_id from = 0; from < ctx->process_count; from++) {
-            if (from == ctx->id) continue;
+            if (from == ctx->id || ctx->read_fd[from] < 0) continue;
+            alive = 1;
             int rc = receive_from(ctx, from, msg, 0);
             if (rc <= 0) return rc;
         }
+        if (!alive) return -1;
         sched_yield();
     }
 }
