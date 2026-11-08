@@ -52,34 +52,60 @@ typedef struct {
     BalanceHistory history;
 } Account;
 
-static void account_init(Account *account, local_id id, balance_t initial, timestamp_t now) {
+static void account_init(Account *account, local_id id, balance_t initial) {
     memset(account, 0, sizeof(*account));
     account->balance = initial;
     account->history.s_id = id;
-    now = clamp_time(now);
-    for (timestamp_t t = 0; t <= now; t++) {
-        account->history.s_history[t].s_time = t;
-        account->history.s_history[t].s_balance = initial;
-        account->history.s_history[t].s_balance_pending_in = 0;
-    }
-    account->history.s_history_len = (uint8_t)(now + 1);
+    account->history.s_history[0].s_time = 0;
+    account->history.s_history[0].s_balance = initial;
+    account->history.s_history[0].s_balance_pending_in = 0;
+    account->history.s_history_len = 1;
 }
 
 static void account_set(Account *account, timestamp_t now, balance_t value) {
     now = clamp_time(now);
     timestamp_t last = (timestamp_t)(account->history.s_history_len - 1);
-    balance_t previous = account->history.s_history[last].s_balance;
+    if (now < last) now = last;
+    balance_t balance = account->history.s_history[last].s_balance;
+    balance_t pending = account->history.s_history[last].s_balance_pending_in;
     for (timestamp_t t = (timestamp_t)(last + 1); t < now; t++) {
         account->history.s_history[t].s_time = t;
-        account->history.s_history[t].s_balance = previous;
-        account->history.s_history[t].s_balance_pending_in = 0;
+        account->history.s_history[t].s_balance = balance;
+        account->history.s_history[t].s_balance_pending_in = pending;
     }
     account->history.s_history[now].s_time = now;
     account->history.s_history[now].s_balance = value;
-    account->history.s_history[now].s_balance_pending_in = 0;
+    account->history.s_history[now].s_balance_pending_in = pending;
     if (account->history.s_history_len < (uint8_t)(now + 1))
         account->history.s_history_len = (uint8_t)(now + 1);
     account->balance = value;
+}
+
+/* Money leaves the sender at sent and is stored here at recv. Between these
+ * moments it is still in the channel, so the column sum keeps it in pending. */
+static void account_receive(Account *account, timestamp_t sent, timestamp_t recv, balance_t amount) {
+    sent = clamp_time(sent);
+    recv = clamp_time(recv);
+    if (sent > recv) sent = recv;
+
+    timestamp_t last = (timestamp_t)(account->history.s_history_len - 1);
+    balance_t balance = account->history.s_history[last].s_balance;
+    balance_t pending = account->history.s_history[last].s_balance_pending_in;
+    for (timestamp_t t = (timestamp_t)(last + 1); t < recv; t++) {
+        account->history.s_history[t].s_time = t;
+        account->history.s_history[t].s_balance = balance;
+        account->history.s_history[t].s_balance_pending_in = pending;
+    }
+    for (timestamp_t t = sent; t < recv; t++) {
+        account->history.s_history[t].s_balance_pending_in =
+            (balance_t)(account->history.s_history[t].s_balance_pending_in + amount);
+    }
+    account->history.s_history[recv].s_time = recv;
+    account->history.s_history[recv].s_balance = (balance_t)(balance + amount);
+    account->history.s_history[recv].s_balance_pending_in = pending;
+    if (account->history.s_history_len < (uint8_t)(recv + 1))
+        account->history.s_history_len = (uint8_t)(recv + 1);
+    account->balance = (balance_t)(balance + amount);
 }
 
 static int set_nonblock(int fd) {
@@ -124,24 +150,26 @@ static int handle_transfer(Context *ctx, Account *account, const Message *incomi
 
     TransferOrder order;
     memcpy(&order, incoming->s_payload, sizeof(order));
-    timestamp_t now = get_physical_time();
     char text[128];
 
     if (ctx->id == order.s_src) {
+        if (send(ctx, order.s_dst, incoming) != 0) return -1;
+        timestamp_t now = get_lamport_time();
         account_set(account, now, (balance_t)(account->balance - order.s_amount));
         snprintf(text, sizeof(text), log_transfer_out_fmt, (int)now, ctx->id, order.s_amount, order.s_dst);
         log_event(text);
-
-        return send(ctx, order.s_dst, incoming);
+        return 0;
     }
 
     if (ctx->id == order.s_dst) {
-        account_set(account, now, (balance_t)(account->balance + order.s_amount));
+        timestamp_t sent = incoming->s_header.s_local_time;
+        timestamp_t now = get_lamport_time();
+        account_receive(account, sent, now, order.s_amount);
         snprintf(text, sizeof(text), log_transfer_in_fmt, (int)now, ctx->id, order.s_amount, order.s_src);
         log_event(text);
 
         Message ack;
-        set_message(&ack, ACK, NULL, 0, now);
+        set_message(&ack, ACK, NULL, 0, 0);
         return send(ctx, PARENT_ID, &ack);
     }
 
@@ -158,10 +186,10 @@ static int send_history(Context *ctx, const Account *account, timestamp_t time) 
 
 static int child_work(Context *ctx, balance_t initial) {
     Account account;
-    timestamp_t now = get_physical_time();
-    account_init(&account, ctx->id, initial, now);
+    account_init(&account, ctx->id, initial);
 
     char text[128];
+    timestamp_t now = (timestamp_t)(get_lamport_time() + 1);
     snprintf(text, sizeof(text), log_started_fmt, (int)now, ctx->id, getpid(), getppid(), initial);
     log_event(text);
 
@@ -170,7 +198,7 @@ static int child_work(Context *ctx, balance_t initial) {
     if (send_multicast(ctx, &msg) != 0) return -1;
     if (await_from_children(ctx, STARTED) != 0) return -1;
 
-    now = get_physical_time();
+    now = get_lamport_time();
     snprintf(text, sizeof(text), log_received_all_started_fmt, (int)now, ctx->id);
     log_event(text);
 
@@ -183,18 +211,18 @@ static int child_work(Context *ctx, balance_t initial) {
             if (handle_transfer(ctx, &account, &msg) != 0) return -1;
         } else if (msg.s_header.s_type == STOP && !stop) {
             stop = 1;
-            now = get_physical_time();
-            account_set(&account, now, account.balance);
+            now = (timestamp_t)(get_lamport_time() + 1);
             snprintf(text, sizeof(text), log_done_fmt, (int)now, ctx->id, account.balance);
             log_event(text);
             set_message(&msg, DONE, text, (uint16_t)strlen(text), now);
             if (send_multicast(ctx, &msg) != 0) return -1;
+            account_set(&account, get_lamport_time(), account.balance);
         } else if (msg.s_header.s_type == DONE) {
             done_count++;
         }
     }
 
-    now = get_physical_time();
+    now = get_lamport_time();
     account_set(&account, now, account.balance);
     snprintf(text, sizeof(text), log_received_all_done_fmt, (int)now, ctx->id);
     log_event(text);
@@ -216,10 +244,11 @@ static void align_histories(AllHistory *all) {
         if (history->s_history_len == 0) continue;
         timestamp_t last = (timestamp_t)(history->s_history_len - 1);
         balance_t balance = history->s_history[last].s_balance;
+        balance_t pending = history->s_history[last].s_balance_pending_in;
         for (timestamp_t t = (timestamp_t)(last + 1); t <= max_time; t++) {
             history->s_history[t].s_time = t;
             history->s_history[t].s_balance = balance;
-            history->s_history[t].s_balance_pending_in = 0;
+            history->s_history[t].s_balance_pending_in = pending;
         }
         history->s_history_len = (uint8_t)(max_time + 1);
     }
@@ -231,7 +260,7 @@ static int parent_work(Context *ctx) {
     bank_robbery(ctx, (local_id)(ctx->process_count - 1));
 
     Message stop;
-    set_message(&stop, STOP, NULL, 0, get_physical_time());
+    set_message(&stop, STOP, NULL, 0, 0);
     if (send_multicast(ctx, &stop) != 0) return -1;
     if (await_from_children(ctx, DONE) != 0) return -1;
 
@@ -267,9 +296,8 @@ void transfer(void *parent_data, local_id src, local_id dst, balance_t amount) {
     order.s_dst = dst;
     order.s_amount = amount;
 
-    timestamp_t now = get_physical_time();
     Message msg;
-    set_message(&msg, TRANSFER, &order, sizeof(order), now);
+    set_message(&msg, TRANSFER, &order, sizeof(order), 0);
     if (send(parent_data, src, &msg) != 0) _exit(1);
     if (receive(parent_data, dst, &msg) != 0 || msg.s_header.s_type != ACK) _exit(1);
 }
